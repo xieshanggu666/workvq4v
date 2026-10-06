@@ -88,6 +88,8 @@ class SessionDetail(BaseModel):
     refugee_intake: Optional[Dict[str, Any]] = None
     # 难民安置面板概览（在检/待接纳人数、每日配给、累计统计）
     refugee_summary: Optional[Dict[str, Any]] = None
+    # 贸易救援/联盟援助累计战绩（成功交付/失败计数，终局贡献分依据）
+    mission_stats: Optional[Dict[str, Any]] = None
     # 医疗救治中心病例簿（登记/治疗/隔离/康复/病亡全履历）与床位概览
     medical_cases: Optional[List[Dict[str, Any]]] = None
     medical_summary: Optional[Dict[str, Any]] = None

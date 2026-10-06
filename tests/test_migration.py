@@ -671,3 +671,188 @@ def test_ended_save_clears_refugee_intake(db):
     fixed = db.get(GameSession, sid)
     assert fixed.refugee_intake is None
     assert BunkerEngine(db, fixed).phase == "ended"
+
+
+# ---- 贸易/援助战绩回填与旧结局贡献补全 ----
+
+def _insert_log(conn, sid, day, etype, title, detail=""):
+    conn.execute(
+        text(
+            "INSERT INTO event_logs (session_id, day, event_type, title, detail, decision) "
+            "VALUES (:sid, :day, :etype, :title, :detail, NULL)"
+        ),
+        {"sid": sid, "day": day, "etype": etype, "title": title, "detail": detail},
+    )
+
+
+def test_backfills_mission_stats_column(db):
+    """缺列旧表经 ensure_schema 后补齐 mission_stats，旧行为 NULL。"""
+    gs = make_session(db)
+    db.commit()
+    db.expire_all()
+    db.execute(text("ALTER TABLE game_sessions RENAME TO gs_old"))
+    db.execute(text(
+        "CREATE TABLE game_sessions ("
+        "id INTEGER PRIMARY KEY, name VARCHAR(64), day INTEGER, target_day INTEGER, "
+        "status VARCHAR(16), resources JSON, survivors INTEGER, outcome JSON, "
+        "score INTEGER, created_at DATETIME, updated_at DATETIME)"
+    ))
+    db.execute(text(
+        "INSERT INTO game_sessions SELECT id,name,day,target_day,status,resources,"
+        "survivors,outcome,score,created_at,updated_at FROM gs_old"
+    ))
+    db.execute(text("DROP TABLE gs_old"))
+    db.commit()
+
+    ensure_schema(engine)
+    db.expire_all()
+    assert db.query(GameSession).first().mission_stats is None
+
+
+def test_mission_stats_reconstructed_from_event_logs(db):
+    """旧档缺 mission_stats：归一化从终态结算日志重建战绩，撤单/驳回不计。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    with engine.begin() as conn:
+        _insert_log(conn, sid, 3, "trade", "救援送达·岭上镇")
+        _insert_log(conn, sid, 4, "trade", "救援送达·旧港码头")
+        _insert_log(conn, sid, 5, "trade", "采购到货·变电站营地")
+        _insert_log(conn, sid, 6, "trade", "订单失败·七号穹顶")
+        # 撤销/驳回：标题不含终态前缀，不计入
+        _insert_log(conn, sid, 7, "trade", "撤单·岭上镇")
+        _insert_log(conn, sid, 7, "trade", "审核驳回·旧港码头")
+        _insert_log(conn, sid, 8, "aid", "援助交付·避风港医疗站")
+        _insert_log(conn, sid, 9, "aid", "援助失败·幽谷定居点")
+        _insert_log(conn, sid, 10, "aid", "押运审核未过·铸铁要塞")
+        # 撤约/拒签/逾期：不计入
+        _insert_log(conn, sid, 10, "aid", "撤约·甘泉营地")
+        _insert_log(conn, sid, 10, "aid", "签约被拒·甘泉营地")
+        _insert_log(conn, sid, 10, "aid", "签约逾期·甘泉营地")
+
+    n = reconcile_old_saves(engine)
+    assert n == 1
+    db.expire_all()
+    stats = db.get(GameSession, sid).mission_stats
+    assert stats == {
+        "rescue_delivered": 2,
+        "procure_delivered": 1,
+        "aid_delivered": 1,
+        "trade_failed": 1,
+        "aid_failed": 2,
+    }
+    # 幂等：再次归一化不覆盖已回填的值、零写入
+    assert reconcile_old_saves(engine) == 0
+    db.expire_all()
+    assert db.get(GameSession, sid).mission_stats["rescue_delivered"] == 2
+
+
+def test_no_mission_logs_leaves_mission_stats_null(db):
+    """旧档从未做过贸易/援助：回填结果全 0，保持 NULL 且零写入。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    assert reconcile_old_saves(engine) == 0
+    db.expire_all()
+    assert db.get(GameSession, sid).mission_stats is None
+
+
+def test_ended_legacy_outcome_enriched_with_score_parts(db):
+    """已结束旧结局缺 score_parts：归一化按现存统计补齐并重算总分。"""
+    from app.services import engine as engine_mod
+    gs = make_session(db)
+    sid = gs.id
+    legacy_outcome = {
+        "win": True,
+        "reason": "曙光降临",
+        "survivors": 3,
+        "day": 120,
+        "avg_health": 88.0,
+        "medical": {
+            "total": 2, "active": 0, "recovered": 2, "deceased": 0,
+            "care_days": 4, "medical_crisis": 10,
+        },
+        "refugee": {
+            "applications": 1, "accepted": 2, "admitted": 2,
+            "rejected": 0, "repatriated": 0, "quarantine_dead": 0,
+        },
+    }
+    db.execute(
+        text("UPDATE game_sessions SET status='win', score = :score, outcome = :o "
+             "WHERE id = :sid"),
+        {"score": 100, "o": json.dumps(legacy_outcome, ensure_ascii=False), "sid": sid},
+    )
+    db.commit()
+    with engine.begin() as conn:
+        _insert_log(conn, sid, 5, "aid", "援助交付·避风港医疗站")
+
+    reconcile_old_saves(engine)
+    db.expire_all()
+    row = db.get(GameSession, sid)
+    out = row.outcome
+    assert out["score_parts"]["medical"] == (
+        2 * engine_mod.SCORE_MED_RECOVERED + 4 * engine_mod.SCORE_MED_CARE_DAY
+    )
+    assert out["score_parts"]["refugee"] == 2 * engine_mod.SCORE_REFUGEE_ADMITTED
+    assert out["score_parts"]["trade_aid"] == engine_mod.SCORE_AID_DELIVERED
+    assert out["trade_aid"]["aid_delivered"] == 1
+    # 原始履历字段保留
+    assert out["reason"] == "曙光降临"
+    assert out["avg_health"] == 88.0
+    # 基础分按结局快照 day=120 / survivors=3、士气缺失取中性 60 估算：
+    # int(3 * 120 * (0.5 + 60/200)) = 288
+    assert out["base_score"] == int(3 * 120 * (0.5 + 60 / 200.0)) == 288
+    # 总分重算为各分量之和（不再是旧的 100）
+    assert row.score == out["recomputed_score"] == out["score_parts"]["total"]
+    # 幂等：已补齐 score_parts 后不再重复改写
+    assert reconcile_old_saves(engine) == 0
+
+
+def test_running_save_does_not_enrich_outcome(db):
+    """运行中档案不做旧结局补全，仅回填战绩。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    with engine.begin() as conn:
+        _insert_log(conn, sid, 3, "trade", "救援送达·岭上镇")
+    reconcile_old_saves(engine)
+    db.expire_all()
+    row = db.get(GameSession, sid)
+    assert row.status == "running"
+    assert row.outcome is None
+    assert row.mission_stats["rescue_delivered"] == 1
+
+
+def test_snapshot_cleanup_does_not_rewrite_score(db):
+    """快照归一化触发的 UPDATE 不得改写历史 score 列。"""
+    gs = make_session(db)
+    gs.status = "win"
+    db.commit()
+    sid = gs.id
+    # 已是新结构结局（含 score_parts）：归一化只清空悬挂快照，不动分数与结局
+    outcome = {
+        "win": True, "reason": "x", "survivors": 3, "day": 120,
+        "avg_health": 90, "base_score": 324,
+        "score_parts": {"base": 324, "medical": 0, "refugee": 0,
+                        "trade_aid": 0, "total": 324},
+        "medical": {"total": 0, "active": 0, "recovered": 0, "deceased": 0,
+                    "care_days": 0, "medical_crisis": 0},
+        "refugee": {"applications": 0, "accepted": 0, "admitted": 0,
+                    "rejected": 0, "repatriated": 0, "quarantine_dead": 0},
+        "trade_aid": {"rescue_delivered": 0, "procure_delivered": 0,
+                      "aid_delivered": 0, "trade_failed": 0, "aid_failed": 0},
+    }
+    db.execute(
+        text("UPDATE game_sessions SET score=777, outcome=:o, "
+             "pending_crisis=:c WHERE id=:sid"),
+        {"o": json.dumps(outcome, ensure_ascii=False),
+         "c": json.dumps({"event": "mutiny", "choices": [{"key": "x"}]}),
+         "sid": sid},
+    )
+    db.commit()
+    reconcile_old_saves(engine)
+    db.expire_all()
+    row = db.get(GameSession, sid)
+    assert row.score == 777
+    assert row.pending_crisis is None
+    assert row.outcome["score_parts"]["total"] == 324  # 结局未被二次重算

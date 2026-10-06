@@ -77,6 +77,11 @@ class GameSession(Base):
     last_refugee = Column(JSON, nullable=True)
     # 难民安置累计统计：申请/批准/接纳/遣返/拒绝/检疫病亡人数，终局随 outcome 归档
     refugee_stats = Column(MutableDict.as_mutable(JSON), nullable=True)
+    # 贸易救援 + 联盟援助累计战绩统计：成功交付（求援/采购/联盟医援）与
+    # 押运/交付失败的累计计数。只有订单/协议真正收敛（成功入库或失败回退）时
+    # 才 +1：审核驳回、撤单/撤约、逾期关闭不计入，撤销或失败绝不重复计分。
+    # 终局据此结算"贸易援助"贡献分，缺列旧档案由迁移从事件日志回填
+    mission_stats = Column(MutableDict.as_mutable(JSON), nullable=True)
     # 医疗救治中心病例簿：每名居民的病例经历 登记→治疗/隔离→康复/病亡。
     # 活跃病例驱动每日医疗结算（床位占用/物资消耗/传染扩散），终态病例作为
     # 危机后健康结算履历保留至终局。引擎以"深拷贝整体回写"（_save_cases）

@@ -204,6 +204,8 @@ def get_session_detail(gs, db):
         medical_summary=BunkerEngine(db, gs).med_summary(),
         # 难民安置概览（在检/待接纳人数、每日配给、累计统计）
         refugee_summary=BunkerEngine(db, gs).refugee_summary(),
+        # 贸易救援/联盟援助累计战绩（成功交付/失败计数）
+        mission_stats=BunkerEngine(db, gs).mission_stats(),
         medical_crisis=gs.medical_crisis or 0,
         reputation=gs.reputation if gs.reputation is not None else 50,
         residents=residents,

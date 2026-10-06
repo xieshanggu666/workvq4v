@@ -6,6 +6,7 @@
 - trade_order / last_trade：贸易救援订单与幂等凭据列，旧行补 NULL
 - aid_pact / last_aid：地堡联盟援助协议与幂等凭据列，旧行补 NULL
 - refugee_intake / last_refugee / refugee_stats：跨聚落难民安置快照、幂等凭据与累计统计，旧行补 NULL
+- mission_stats：贸易救援/联盟援助累计战绩列，旧行补 NULL 后由归一化从事件日志回填
 - medical_cases：医疗救治中心病例簿列，旧行补 NULL
 - medical_crisis：地堡医疗危机表，旧行统一从 0 开始
 - reputation：对外信誉，旧行统一从初始值 50 开始
@@ -19,6 +20,10 @@
 - 损坏/悬空的快照（成员全部不在档、目标居民失踪、JSON 残缺）不阻塞每日推进
 - 难民安置快照结构残缺或已无存活难民时清除，避免卡在无法接纳/遣返的死状态
 - 病例簿中结构残缺或居民已不在档的活跃病例收敛/剔除，终态履历同步校正
+- 贸易救援/联盟援助战绩（mission_stats）旧行缺失时从事件日志按终态结算日志回填：
+  仅成功交付与押运/交付失败各计一次，撤单/撤约/驳回/逾期日志天然不计入
+- 已结束档案的旧结局缺少 base_score / score_parts / trade_aid 时按现存统计补齐
+  （不改写历史总分），旧存档在新结局页上也能看到各项贡献说明
 - survivors 与实际存活居民数漂移时以居民表为准校正
 """
 import json
@@ -69,6 +74,9 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_refugee JSON"))
         if "refugee_stats" not in columns:
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN refugee_stats JSON"))
+        if "mission_stats" not in columns:
+            # 贸易救援/联盟援助累计战绩：旧档案补列后由 reconcile 从事件日志回填
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN mission_stats JSON"))
         if "reputation" not in columns:
             # NOT NULL + 常量默认值：旧档案从未开展贸易，信誉从初始值 50 开始
             conn.execute(
@@ -102,27 +110,49 @@ def reconcile_old_saves(engine):
     不会无谓 bump 乐观锁版本号。
     """
     inspector = inspect(engine)
-    if "game_sessions" not in inspector.get_table_names():
+    table_names = inspector.get_table_names()
+    if "game_sessions" not in table_names:
         return 0
     resident_columns = _existing_columns(engine, "residents")
+    session_columns = _existing_columns(engine, "game_sessions")
+    has_event_logs = "event_logs" in table_names
+    # 旧表可能缺少部分后加列：只 SELECT 实际存在的列，缺失列按 None 处理
+    wanted = [
+        "id", "status", "pending_crisis", "expedition", "trade_order",
+        "aid_pact", "medical_cases", "survivors", "refugee_intake",
+        "mission_stats", "outcome", "day", "score", "medical_crisis",
+        "refugee_stats",
+    ]
+    selected = [c for c in wanted if c in session_columns]
     with engine.begin() as conn:
         rows = conn.execute(
-            text(
-                "SELECT id, status, pending_crisis, expedition, trade_order, "
-                "aid_pact, medical_cases, survivors, refugee_intake "
-                "FROM game_sessions"
-            )
+            text(f"SELECT {', '.join(selected)} FROM game_sessions")
         ).all()
         updates = []
         for row in rows:
-            (sid, status, crisis_raw, exp_raw, trade_raw,
-             aid_raw, med_raw, survivors, refugee_raw) = row
+            data = dict(zip(selected, row))
+            sid = data.get("id")
+            status = data.get("status")
+            crisis_raw = data.get("pending_crisis")
+            exp_raw = data.get("expedition")
+            trade_raw = data.get("trade_order")
+            aid_raw = data.get("aid_pact")
+            med_raw = data.get("medical_cases")
+            survivors = data.get("survivors")
+            refugee_raw = data.get("refugee_intake")
+            mission_raw = data.get("mission_stats")
+            outcome_raw = data.get("outcome")
+            day = data.get("day")
+            crisis_val = data.get("medical_crisis")
+            ref_stats_raw = data.get("refugee_stats")
             old_crisis = _loads(crisis_raw)
             old_exp = _loads(exp_raw)
             old_trade = _loads(trade_raw)
             old_aid = _loads(aid_raw)
             old_med = _loads(med_raw)
             old_refugee = _loads(refugee_raw)
+            old_mission = _loads(mission_raw)
+            old_outcome = _loads(outcome_raw)
             alive_count = None
             if {"id", "alive", "session_id"} <= resident_columns:
                 alive_count = conn.execute(
@@ -149,8 +179,46 @@ def reconcile_old_saves(engine):
             # 病例簿归一化与档案阶段无关：活跃病例绑定的居民必须仍在档且状态一致
             new_med, med_changed = _clean_medical_cases(old_med, conn, sid)
 
+            # 战绩回填：旧档案没有 mission_stats 列（补列后为 NULL）时，从事件
+            # 日志里唯一的终态结算日志重建。只认成功交付与失败回退两类标题，
+            # 撤单·/撤约·/审核驳回/签约逾期天然不计；同一终态只写一条日志，
+            # 故撤销或失败不会被重复计分。回填一次后不再覆盖新引擎写入的值。
+            mission_changed = False
+            new_mission = old_mission
+            if old_mission is None and has_event_logs:
+                new_mission = _reconstruct_mission_stats(conn, sid)
+                if any(new_mission.values()):
+                    mission_changed = True
+                else:
+                    new_mission = None  # 无战绩：保持 NULL，零写入
+
+            # 已结束的旧结局补齐新评分字段：按现存病例/难民/战绩重算各项贡献
+            # 与总分（旧公式是新公式 base 分量的子集），使旧存档在新结局页也能
+            # 正常展示贡献明细；已是新结构（含 score_parts）的结局不动。
+            outcome_changed = False
+            new_outcome = old_outcome
+            if status != "running" and isinstance(old_outcome, dict) \
+                    and "score_parts" not in old_outcome:
+                # 终局快照里的 day/survivors 才是结算时刻的值，优先于当前列
+                # （历史行的列可能与结局漂移）；缺省时再退回列值
+                end_day = old_outcome.get("day") or day
+                end_survivors = old_outcome.get("survivors")
+                if end_survivors is None:
+                    end_survivors = alive_count if alive_count is not None else survivors
+                new_outcome = _enrich_legacy_outcome(
+                    old_outcome,
+                    cases=(new_med or []),
+                    refugee_stats=_loads(ref_stats_raw) or {},
+                    mission_stats=new_mission or {},
+                    survivors=end_survivors,
+                    day=end_day,
+                    crisis=(crisis_val or 0) if crisis_val is not None else 0,
+                )
+                outcome_changed = new_outcome != old_outcome
+
             if (crisis_changed or exp_changed or trade_changed or aid_changed
-                    or med_changed or refugee_changed
+                    or med_changed or refugee_changed or mission_changed
+                    or outcome_changed
                     or (alive_count is not None and alive_count != survivors)):
                 updates.append(
                     {
@@ -174,20 +242,191 @@ def reconcile_old_saves(engine):
                         if new_refugee is not None
                         else None,
                         "survivors": alive_count if alive_count is not None else survivors,
+                        "mission": json.dumps(new_mission, ensure_ascii=False)
+                        if new_mission is not None
+                        else None,
+                        "outcome": json.dumps(new_outcome, ensure_ascii=False)
+                        if new_outcome is not None
+                        else None,
+                        # 旧结局补齐贡献字段时同步把总分重算为新口径（各分量之和），
+                        # 保证结局页展示的总分等于 score 列；其余行不动历史分数
+                        "score": new_outcome["recomputed_score"]
+                        if outcome_changed and isinstance(new_outcome, dict)
+                        else None,
+                        "has_mission_col": "mission_stats" in session_columns,
+                        "has_outcome_col": "outcome" in session_columns,
+                        "has_score_col": "score" in session_columns,
                     }
                 )
         for u in updates:
+            sets = [
+                "pending_crisis = :crisis",
+                "expedition = :expedition",
+                "trade_order = :trade",
+                "aid_pact = :aid",
+                "medical_cases = :medical",
+                "refugee_intake = :refugee",
+            ]
+            params = {k: v for k, v in u.items()
+                      if k not in ("has_mission_col", "has_outcome_col", "has_score_col")}
+            # survivors/score 列在所有建表版本中都存在，但仍按实际列集合兜底
+            if "survivors" in session_columns:
+                sets.append("survivors = :survivors")
+            else:
+                params.pop("survivors", None)
+            if u["has_score_col"] and u["score"] is not None:
+                sets.append("score = :score")
+            else:
+                params.pop("score", None)
+            if u["has_mission_col"]:
+                sets.append("mission_stats = :mission")
+            if u["has_outcome_col"]:
+                sets.append("outcome = :outcome")
             conn.execute(
-                text(
-                    "UPDATE game_sessions SET pending_crisis = :crisis, "
-                    "expedition = :expedition, trade_order = :trade, "
-                    "aid_pact = :aid, medical_cases = :medical, "
-                    "refugee_intake = :refugee, "
-                    "survivors = :survivors WHERE id = :sid"
-                ),
-                u,
+                text(f"UPDATE game_sessions SET {', '.join(sets)} WHERE id = :sid"),
+                params,
             )
     return len(updates)
+
+
+# 终态结算日志标题 → 战绩计数键。撤单·/撤约·/签约被拒/签约逾期等非终态
+# （未实际押运或未完成交付）的标题不在表中，日志重建时自然不计分。
+_TRADE_SUCCESS_TITLES = ("救援送达·", "采购到货·")
+_TRADE_FAIL_TITLE = "订单失败·"
+_AID_SUCCESS_TITLE = "援助交付·"
+_AID_FAIL_TITLES = ("援助失败·", "押运审核未过·")
+
+
+def _reconstruct_mission_stats(conn, sid):
+    """从事件日志重建贸易/援助累计战绩（旧存档回填，一次性）。
+
+    每条订单/协议的终态收敛恰好写一条结算日志，故按标题计数即等价于
+    成功交付 / 失败回退次数，且撤单撤约绝不计入。
+    """
+    stats = {
+        "rescue_delivered": 0,
+        "procure_delivered": 0,
+        "aid_delivered": 0,
+        "trade_failed": 0,
+        "aid_failed": 0,
+    }
+    rows = conn.execute(
+        text("SELECT title FROM event_logs WHERE session_id = :sid AND event_type IN ('trade', 'aid')"),
+        {"sid": sid},
+    ).all()
+    for (title,) in rows:
+        if not isinstance(title, str):
+            continue
+        if title.startswith("救援送达·"):
+            stats["rescue_delivered"] += 1
+        elif title.startswith("采购到货·"):
+            stats["procure_delivered"] += 1
+        elif title.startswith(_TRADE_FAIL_TITLE):
+            stats["trade_failed"] += 1
+        elif title.startswith(_AID_SUCCESS_TITLE):
+            stats["aid_delivered"] += 1
+        elif title.startswith(_AID_FAIL_TITLES):
+            stats["aid_failed"] += 1
+    return stats
+
+
+def _medical_stats_from_cases(cases):
+    """与引擎 _medical_stats 同口径的纯函数：登记/康复/病亡/累计床日。"""
+    active_statuses = {"registered", "treating", "isolated"}
+    return {
+        "total": len(cases),
+        "active": sum(1 for c in cases if c.get("status") in active_statuses),
+        "recovered": sum(1 for c in cases if c.get("status") == "recovered"),
+        "deceased": sum(1 for c in cases if c.get("status") == "deceased"),
+        "care_days": sum(int(c.get("days_cared", 0) or 0) for c in cases),
+    }
+
+
+def _enrich_legacy_outcome(outcome, cases, refugee_stats, mission_stats,
+                           survivors, day, crisis):
+    """旧结局缺 base_score/score_parts/trade_aid 时按现存统计补齐并重算总分。
+
+    旧档案的 score 只含基础生存分；新公式在其上叠加三项贡献分。重算后
+    各项明细之和等于最终总分，旧存档在新结局页看到的口径与新档案完全一致。
+    仅补缺失字段，不覆盖既有 reason/survivors/day/avg_health 等历史值。
+    """
+    from ..services import engine as engine_mod
+
+    # 医疗履历优先取旧结局自带的统计（终局后病例簿可能已无存）；
+    # 旧结局没有时才从归一化后的病例簿重建
+    legacy_med = outcome.get("medical")
+    if isinstance(legacy_med, dict):
+        med = {
+            "total": int(legacy_med.get("total", 0) or 0),
+            "active": int(legacy_med.get("active", 0) or 0),
+            "recovered": int(legacy_med.get("recovered", 0) or 0),
+            "deceased": int(legacy_med.get("deceased", 0) or 0),
+            "care_days": int(legacy_med.get("care_days", 0) or 0),
+            "medical_crisis": int(
+                legacy_med.get("medical_crisis", crisis) or 0
+            ),
+        }
+    else:
+        med = _medical_stats_from_cases(cases)
+        med["medical_crisis"] = crisis
+    # 难民统计同样优先取旧结局自带值，其次读 refugee_stats 列
+    legacy_ref = outcome.get("refugee")
+    if isinstance(legacy_ref, dict):
+        ref_source = legacy_ref
+    else:
+        ref_source = refugee_stats
+    ref = {
+        "applications": int(ref_source.get("applications", 0) or 0),
+        "accepted": int(ref_source.get("accepted", 0) or 0),
+        "admitted": int(ref_source.get("admitted", 0) or 0),
+        "rejected": int(ref_source.get("rejected", 0) or 0),
+        "repatriated": int(ref_source.get("repatriated", 0) or 0),
+        "quarantine_dead": int(ref_source.get("quarantine_dead", 0) or 0),
+    }
+    mission = {
+        "rescue_delivered": int(mission_stats.get("rescue_delivered", 0) or 0),
+        "procure_delivered": int(mission_stats.get("procure_delivered", 0) or 0),
+        "aid_delivered": int(mission_stats.get("aid_delivered", 0) or 0),
+        "trade_failed": int(mission_stats.get("trade_failed", 0) or 0),
+        "aid_failed": int(mission_stats.get("aid_failed", 0) or 0),
+    }
+    morale = outcome.get("avg_morale")
+    if morale is None:
+        # 旧结局没有记录士气：基础分量无法精确复现，按中性士气 60 估算
+        morale = 60.0
+    base = int(survivors * day * (0.5 + morale / 200.0))
+    med_part = (
+        med["recovered"] * engine_mod.SCORE_MED_RECOVERED
+        + med["care_days"] * engine_mod.SCORE_MED_CARE_DAY
+        - med["deceased"] * engine_mod.SCORE_MED_DECEASED
+    )
+    ref_part = (
+        ref["admitted"] * engine_mod.SCORE_REFUGEE_ADMITTED
+        - ref["quarantine_dead"] * engine_mod.SCORE_REFUGEE_QUARANTINE_DEAD
+    )
+    mission_part = (
+        mission["rescue_delivered"] * engine_mod.SCORE_TRADE_RESCUE
+        + mission["procure_delivered"] * engine_mod.SCORE_TRADE_PROCURE
+        + mission["aid_delivered"] * engine_mod.SCORE_AID_DELIVERED
+        - mission["trade_failed"] * engine_mod.SCORE_TRADE_FAILED
+        - mission["aid_failed"] * engine_mod.SCORE_AID_FAILED
+    )
+    parts = {
+        "base": base,
+        "medical": int(med_part),
+        "refugee": int(ref_part),
+        "trade_aid": int(mission_part),
+    }
+    parts["total"] = max(0, base + parts["medical"] + parts["refugee"] + parts["trade_aid"])
+    enriched = dict(outcome)
+    enriched.setdefault("base_score", base)
+    enriched["score_parts"] = parts
+    # medical/ref 已按“旧结局履历优先、档案统计兜底”重建，统一回写
+    enriched["medical"] = med
+    enriched.setdefault("refugee", ref)
+    enriched["trade_aid"] = mission
+    enriched["recomputed_score"] = parts["total"]
+    return enriched
 
 
 def _resident_ids(conn, sid):

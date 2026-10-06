@@ -39,6 +39,7 @@ window.GameView = {
   },
   created() { this.init(); },
   methods: {
+    fmtSigned(v) { return v > 0 ? `+${v}` : `${v}`; },
     async init() {
       this.error = "";
       try {
@@ -544,6 +545,34 @@ window.GameView = {
       const fmt = bag => Object.entries(bag).map(([k, v]) => `${zh[k]} ${v}`).join("、");
       return { treating: fmt(treating), isolated: fmt(isolated) };
     },
+    // ---- 结局贡献分（与引擎 SCORE_* 权重同口径）----
+    scoreParts() {
+      return (this.s && this.s.outcome && this.s.outcome.score_parts) || null;
+    },
+    endMed() {
+      return (this.s && this.s.outcome && this.s.outcome.medical) || {};
+    },
+    endRefugee() {
+      return (this.s && this.s.outcome && this.s.outcome.refugee) || {};
+    },
+    endTrade() {
+      return (this.s && this.s.outcome && this.s.outcome.trade_aid) || {};
+    },
+    // 旧存档迁移后以重算总分为准；新结局直接取贡献分之和；再老的结局无明细时回退 score 列
+    finalScore() {
+      if (!this.s || !this.s.outcome) return this.s ? this.s.score : 0;
+      if (this.s.outcome.recomputed_score != null) return this.s.outcome.recomputed_score;
+      if (this.scoreParts) return this.scoreParts.total;
+      return this.s.score;
+    },
+    scoreWeight() {
+      return {
+        medRecovered: 15, medCareDay: 2, medDeceased: 6,
+        refugeeAdmitted: 12, refugeeDead: 6,
+        tradeRescue: 18, tradeProcure: 10, aidDelivered: 20,
+        tradeFailed: 8, aidFailed: 10,
+      };
+    },
   },
   template: `
   <div v-if="s" class="game" :class="clazz(s.status)">
@@ -978,13 +1007,50 @@ window.GameView = {
           <div><span>存活天数</span><b>{{ s.outcome.day }}</b></div>
           <div><span>幸存者</span><b>{{ s.outcome.survivors }}</b></div>
           <div><span>平均健康</span><b>{{ s.outcome.avg_health == null ? '-' : s.outcome.avg_health }}</b></div>
-          <div><span>得分</span><b>{{ s.score }}</b></div>
+          <div><span>总分</span><b>{{ finalScore }}</b></div>
+        </div>
+        <!-- 各项贡献分：基础生存分 + 医疗救治 / 难民安置 / 贸易援助 -->
+        <div v-if="scoreParts" class="score-parts">
+          <div class="score-row">
+            <span class="score-label">基础生存分</span>
+            <span class="score-dim">幸存者 × 天数 × 士气系数</span>
+            <b class="score-val">{{ scoreParts.base }}</b>
+          </div>
+          <div class="score-row">
+            <span class="score-label">医疗救治</span>
+            <span class="score-dim">
+              康复 {{ endMed.recovered }} 人 ×{{ scoreWeight.medRecovered }}
+              ＋救治 {{ endMed.care_days }} 床日 ×{{ scoreWeight.medCareDay }}
+              －病亡 {{ endMed.deceased }} 人 ×{{ scoreWeight.medDeceased }}
+            </span>
+            <b class="score-val" :class="scoreParts.medical >= 0 ? 'plus' : 'minus'">{{ fmtSigned(scoreParts.medical) }}</b>
+          </div>
+          <div class="score-row">
+            <span class="score-label">难民安置</span>
+            <span class="score-dim">
+              接纳 {{ endRefugee.admitted || 0 }} 人 ×{{ scoreWeight.refugeeAdmitted }}
+              －检疫病亡 {{ endRefugee.quarantine_dead || 0 }} 人 ×{{ scoreWeight.refugeeDead }}
+            </span>
+            <b class="score-val" :class="scoreParts.refugee >= 0 ? 'plus' : 'minus'">{{ fmtSigned(scoreParts.refugee) }}</b>
+          </div>
+          <div class="score-row">
+            <span class="score-label">贸易援助</span>
+            <span class="score-dim">
+              求援送达 {{ endTrade.rescue_delivered || 0 }} 笔 ×{{ scoreWeight.tradeRescue }}
+              ＋采购到货 {{ endTrade.procure_delivered || 0 }} 笔 ×{{ scoreWeight.tradeProcure }}
+              ＋联盟医援 {{ endTrade.aid_delivered || 0 }} 份 ×{{ scoreWeight.aidDelivered }}
+              －贸易失败 {{ endTrade.trade_failed || 0 }} 笔 ×{{ scoreWeight.tradeFailed }}
+              －援助失败 {{ endTrade.aid_failed || 0 }} 份 ×{{ scoreWeight.aidFailed }}
+            </span>
+            <b class="score-val" :class="scoreParts.trade_aid >= 0 ? 'plus' : 'minus'">{{ fmtSigned(scoreParts.trade_aid) }}</b>
+          </div>
         </div>
         <div v-if="s.outcome.medical && s.outcome.medical.total" class="med-end">
           医疗救治：登记 {{ s.outcome.medical.total }} 例 · 康复 {{ s.outcome.medical.recovered }} 人 ·
           病亡 {{ s.outcome.medical.deceased }} 人 · 累计 {{ s.outcome.medical.care_days }} 床日
         </div>
         <div class="med-end">终局医疗危机：{{ s.outcome.medical ? s.outcome.medical.medical_crisis : s.medical_crisis }} / 100</div>
+        <p class="med-end score-note">仅真正结算的结果计分：撤单、撤约、审核驳回与签约逾期不计分；每条病例 / 安置 / 订单只随其唯一终态结算一次，撤销或失败不重复计分。</p>
         <button class="btn primary" @click="onExit">返回档案列表</button>
       </div>
     </div>
