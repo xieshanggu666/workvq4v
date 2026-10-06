@@ -250,6 +250,21 @@ select {
 .med-hist-item.recovered .chip { color: var(--primary); border-color: rgba(67,200,122,.5); }
 .med-hist-item.deceased .chip { color: var(--danger); border-color: rgba(229,72,77,.5); }
 .med-end { font-size: 13px; color: var(--dim); margin: 4px 0 12px; }
+/* ---------- 结局外部贡献评分 ---------- */
+.end-contrib { text-align: left; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--bg-soft); padding: 12px 14px; margin: 8px 0 14px; font-size: 13px; }
+.end-contrib-title { text-align: center; color: var(--dim); margin-bottom: 8px; }
+.end-contrib-grp { padding: 6px 0; border-top: 1px dashed var(--line); }
+.end-contrib-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.end-contrib-head b { font-size: 14px; }
+.end-contrib-items { display: flex; flex-wrap: wrap; gap: 6px; }
+.end-contrib-item { color: var(--dim); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+.end-contrib-item.pos, .end-contrib-head b.pos, .end-contrib-total b.pos { color: var(--primary); }
+.end-contrib-item.neg, .end-contrib-head b.neg, .end-contrib-total b.neg { color: var(--danger); }
+.end-contrib-item.zero, .end-contrib-head b.zero, .end-contrib-total b.zero { color: var(--dim); }
+.end-contrib-total { text-align: center; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.end-contrib-note { text-align: center; color: var(--dim); font-size: 12px; margin-top: 6px; line-height: 1.6; }
 /* ---------- 跨聚落难民安置 ---------- */
 .refugee-list { display: flex; flex-direction: column; gap: 8px; margin: 6px 0; }
 .refugee-item { display: flex; align-items: center; gap: 12px; background: var(--bg-soft);

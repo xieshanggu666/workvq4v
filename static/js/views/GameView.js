@@ -513,6 +513,16 @@ window.GameView = {
       return this.s && this.s.medical_summary
         ? this.s.medical_summary.medical_crisis_high : 70;
     },
+    // 结局外部贡献分项（医疗救治 / 难民安置 / 贸易援助），旧档案无 contributions 时为空
+    endContribGroups() {
+      const c = this.s && this.s.outcome && this.s.outcome.contributions;
+      if (!c) return [];
+      return [
+        { key: "medical", name: "医疗救治", points: c.medical.points, items: c.medical.items },
+        { key: "refugee", name: "难民安置", points: c.refugee.points, items: c.refugee.items },
+        { key: "mission", name: "贸易援助", points: c.mission.points, items: c.mission.items },
+      ];
+    },
     // 抉择锁：地堡危机/探索遭遇/途中事件待处理时，推进与一切经营动作统一禁用
     actionLocked() {
       return !!(this.crisis || this.expPending || this.tradePending || this.aidPending);
@@ -595,7 +605,7 @@ window.GameView = {
           <div class="card"><div class="k">幸存者</div><div class="v">{{ s.survivors }}</div><div class="hint">人口即火种</div></div>
           <div class="card"><div class="k">平均健康</div><div class="v">{{ s.residents.length ? fmt(alive.reduce((a,r)=>a+r.health,0)/alive.length) : 0 }}</div><div class="hint">救治中心维系</div></div>
           <div class="card"><div class="k">士气</div><div class="v">{{ s.residents.length ? fmt(alive.reduce((a,r)=>a+r.morale,0)/alive.length) : 0 }}</div><div class="hint">影响产出效率</div></div>
-          <div class="card"><div class="k">得分</div><div class="v">{{ s.score }}</div><div class="hint">生存评分</div></div>
+          <div class="card"><div class="k">得分</div><div class="v">{{ s.score }}</div><div class="hint">生存 + 外部贡献评分</div></div>
         </div>
         <div class="fac-grid">
           <div v-for="f in s.facilities" :key="f.id" class="fac">
@@ -985,6 +995,28 @@ window.GameView = {
           病亡 {{ s.outcome.medical.deceased }} 人 · 累计 {{ s.outcome.medical.care_days }} 床日
         </div>
         <div class="med-end">终局医疗危机：{{ s.outcome.medical ? s.outcome.medical.medical_crisis : s.medical_crisis }} / 100</div>
+        <!-- 外部贡献评分明细 -->
+        <div v-if="s.outcome.contributions" class="end-contrib">
+          <div class="end-contrib-title">外部贡献评分（生存基础分 {{ s.outcome.score_base }}）</div>
+          <div v-for="grp in endContribGroups" :key="grp.key" class="end-contrib-grp">
+            <div class="end-contrib-head">
+              <span>{{ grp.name }}</span>
+              <b :class="grp.points > 0 ? 'pos' : (grp.points < 0 ? 'neg' : 'zero')">{{ grp.points > 0 ? '+' : '' }}{{ grp.points }} 分</b>
+            </div>
+            <div class="end-contrib-items">
+              <span v-for="(it, i) in grp.items" :key="i"
+                    class="end-contrib-item" :class="it.points > 0 ? 'pos' : (it.points < 0 ? 'neg' : 'zero')">
+                {{ it.label }}（{{ it.per > 0 ? '+' : '' }}{{ it.per }}/单位，{{ it.points > 0 ? '+' : '' }}{{ it.points }}）
+              </span>
+            </div>
+          </div>
+          <div class="end-contrib-total">
+            贡献合计 <b :class="s.outcome.contributions.total_bonus > 0 ? 'pos' : (s.outcome.contributions.total_bonus < 0 ? 'neg' : 'zero')">{{ s.outcome.contributions.total_bonus > 0 ? '+' : '' }}{{ s.outcome.contributions.total_bonus }} 分</b>
+            ，总分 {{ s.score }}
+          </div>
+          <div class="end-contrib-note">撤约 / 撤单、审核被拒与签约逾期未形成援助结果，不计分；每份订单与协议只在成功或失败终局结算一次。</div>
+        </div>
+        <div v-else class="med-end">该档案来自旧版本，结局评分为生存基础分口径，不含外部贡献分项。</div>
         <button class="btn primary" @click="onExit">返回档案列表</button>
       </div>
     </div>

@@ -6,6 +6,7 @@
 - trade_order / last_trade：贸易救援订单与幂等凭据列，旧行补 NULL
 - aid_pact / last_aid：地堡联盟援助协议与幂等凭据列，旧行补 NULL
 - refugee_intake / last_refugee / refugee_stats：跨聚落难民安置快照、幂等凭据与累计统计，旧行补 NULL
+- mission_stats：贸易/援助终局累计统计，旧行补 NULL（历史订单无法回溯，从空统计开始）
 - medical_cases：医疗救治中心病例簿列，旧行补 NULL
 - medical_crisis：地堡医疗危机表，旧行统一从 0 开始
 - reputation：对外信誉，旧行统一从初始值 50 开始
@@ -69,6 +70,10 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_refugee JSON"))
         if "refugee_stats" not in columns:
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN refugee_stats JSON"))
+        if "mission_stats" not in columns:
+            # 贸易/援助终局累计统计：旧档案历史订单/协议早已收敛清除无法回溯，
+            # 从空统计开始，仅对迁移后新发生的终局计分
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN mission_stats JSON"))
         if "reputation" not in columns:
             # NOT NULL + 常量默认值：旧档案从未开展贸易，信誉从初始值 50 开始
             conn.execute(

@@ -150,6 +150,23 @@ REFUGEE_ADMIT_MORALE = 5.0         # 接纳难民：在堡全员（含新居民�
 REFUGEE_REPATRIATE_MORALE = -3.0   # 遣返难民：在堡全员士气受挫
 REFUGEE_JOIN_HEALTH = 70.0         # 危机事件直接加入的幸存者健康（既有口径）
 
+# 结局贡献评分：在"幸存者 × 天数 × 士气系数"的生存基础分之外，
+# 医疗救治、难民安置、贸易援助三类外部贡献按终局成败计入总分。
+# 只奖励/惩罚真正收敛的终局（交付成功/确认失败）：撤约、撤单、审核被拒、
+# 逾期关闭等未形成援助结果的动作一律不计分，且每条终局订单/协议只结算一次
+# （交付/失败路径自带幂等凭据，统计在同一次收敛内完成，回放不重复计数）。
+SCORE_MED_PER_RECOVERED = 20       # 每名康复病例
+SCORE_MED_PER_CARE_DAY = 2         # 每个累计救治床日
+SCORE_MED_PER_DECEASED = -10       # 每名病亡病例（救治失败的代价）
+SCORE_REFUGEE_PER_ADMITTED = 25    # 每名成功接纳的难民
+SCORE_REFUGEE_PER_DEAD = -12       # 每名检疫病亡难民
+SCORE_REFUGEE_PER_REJECTED = -4    # 每名被拒绝的难民
+SCORE_REFUGEE_PER_REPATRIATED = -8  # 每名被遣返的难民
+SCORE_TRADE_PER_DELIVERED = 40     # 每笔成功交付的贸易/救援订单
+SCORE_TRADE_PER_FAILED = -15       # 每笔确认失败的贸易/救援订单
+SCORE_AID_PER_DELIVERED = 50       # 每份成功交付的联盟援助协议
+SCORE_AID_PER_FAILED = -20         # 每份确认失败的联盟援助协议
+
 
 def _clamp(v, lo=0.0, hi=100.0):
     return max(lo, min(hi, v))
@@ -1777,6 +1794,9 @@ class BunkerEngine:
             PENDING_INCIDENT, detail, action=self._TRADE_ACT_SETTLE,
             host_token=order.get("token"),
         )
+        # 终局统计：仅成功交付计入贡献（撤单/审核被拒不进入本路径）。
+        # 凭据回放早于本方法返回，重复请求不会再次计数
+        self._bump_mission_stats(trade_delivered=1)
         # 用交付前快照收敛终局
         self.session.trade_order = None
         self._check_end(forced_verdict=verdict)
@@ -1814,6 +1834,8 @@ class BunkerEngine:
             PENDING_INCIDENT, detail, action=self._TRADE_ACT_SETTLE,
             token=inc_token, host_token=order.get("token"), choice=inc_choice,
         )
+        # 终局统计：确认失败计入负贡献（审核驳回/主动撤单不走本路径，不扣分）
+        self._bump_mission_stats(trade_failed=1)
         self.session.trade_order = None
         self._check_end(forced_verdict=verdict)
         return detail, False
@@ -2124,6 +2146,8 @@ class BunkerEngine:
             PENDING_AID_INCIDENT, detail, action=self._AID_ACT_SETTLE,
             host_token=pact.get("token"),
         )
+        # 终局统计：押运审核未过等同援助失败（医援未送达疫区），计入负贡献
+        self._bump_mission_stats(aid_failed=1)
         self.session.aid_pact = None
         self._check_end(forced_verdict=verdict)
         return False
@@ -2355,6 +2379,8 @@ class BunkerEngine:
             PENDING_AID_INCIDENT, detail, action=self._AID_ACT_SETTLE,
             host_token=pact.get("token"),
         )
+        # 终局统计：仅成功交付计入贡献（撤约/签约被拒/逾期不进入本路径）
+        self._bump_mission_stats(aid_delivered=1)
         self.session.aid_pact = None
         self._check_end(forced_verdict=verdict)
         return detail, False
@@ -2393,6 +2419,8 @@ class BunkerEngine:
             PENDING_AID_INCIDENT, detail, action=self._AID_ACT_SETTLE,
             token=inc_token, host_token=pact.get("token"), choice=inc_choice,
         )
+        # 终局统计：确认失败计入负贡献（撤约/签约被拒/逾期不进入本路径）
+        self._bump_mission_stats(aid_failed=1)
         self.session.aid_pact = None
         self._check_end(forced_verdict=verdict)
         return detail, False
@@ -2497,6 +2525,33 @@ class BunkerEngine:
             stats[k] = int(stats.get(k, 0)) + v
         self.session.refugee_stats = stats
         flag_modified(self.session, "refugee_stats")
+
+    # ---- 贸易/援助终局累计统计（结局贡献评分用）----
+    MISSION_STAT_KEYS = (
+        "trade_delivered", "trade_failed", "aid_delivered", "aid_failed",
+    )
+
+    def mission_stats(self):
+        """贸易/援助终局累计统计（缺列旧档案从零开始）。
+
+        只统计真正收敛的终局：交付成功 / 确认失败。撤约、撤单、审核被拒、
+        签约逾期等未形成援助结果的动作不计入。
+        """
+        stats = self.session.mission_stats or {}
+        return {k: int(stats.get(k, 0)) for k in self.MISSION_STAT_KEYS}
+
+    def _bump_mission_stats(self, **deltas):
+        """累加终局统计。仅在订单/协议的终局收敛路径调用一次，
+        收敛本身由档案级幂等凭据保护（连点/并发落败安全回放），
+        故统计随终局幂等，同一条订单/协议不会重复计分。"""
+        from sqlalchemy.orm.attributes import flag_modified
+        stats = dict(self.session.mission_stats or {})
+        for k, v in deltas.items():
+            if k not in self.MISSION_STAT_KEYS:
+                continue
+            stats[k] = int(stats.get(k, 0)) + v
+        self.session.mission_stats = stats
+        flag_modified(self.session, "mission_stats")
 
     def refugee_summary(self):
         """难民安置面板概览（无副作用）：当前安置进度、在检/待接纳人数与累计统计。"""
@@ -3420,21 +3475,28 @@ class BunkerEngine:
         # 在检/待接纳难民随终局关闭：终局只统计正式居民，不留僵尸安置
         self.session.refugee_intake = None
         alive = [r for r in self.session.residents if r.alive]
-        # 计分：幸存者 * 天数 * 士气系数
+        # 计分：生存基础分（幸存者 * 天数 * 士气系数）
+        #       + 医疗救治 / 难民安置 / 贸易援助三类外部贡献分（按终局成败）
         morale = self.avg_morale()
-        score = int(self.session.survivors * self.session.day * (0.5 + morale / 200.0))
-        self.session.score = score
+        base_score = int(self.session.survivors * self.session.day * (0.5 + morale / 200.0))
         # 危机后健康结算：全周期医疗救治履历随终局归档（登记/康复/病亡/累计救治日）
         med_stats = self._medical_stats()
         avg_health = round(sum(r.health for r in alive) / len(alive), 1) if alive else 0.0
+        contributions = self._contribution_breakdown(med_stats)
+        score = max(0, base_score + int(contributions["total_bonus"]))
+        self.session.score = score
         self.session.outcome = {
             "win": win,
             "reason": reason,
             "survivors": len(alive),
             "day": self.session.day,
             "avg_health": avg_health,
+            "score_base": base_score,
+            "score": score,
+            "contributions": contributions,
             "medical": med_stats,
             "refugee": self.refugee_stats(),
+            "mission": self.mission_stats(),
         }
         if med_stats["total"]:
             self._log(
@@ -3444,7 +3506,76 @@ class BunkerEngine:
                 f"幸存者平均健康 {avg_health}。",
                 decision="健康结算",
             )
+        if contributions["total_bonus"]:
+            self._log(
+                "system", "外部贡献结算",
+                f"医疗救治 {contributions['medical']['points']:+d} 分、"
+                f"难民安置 {contributions['refugee']['points']:+d} 分、"
+                f"贸易援助 {contributions['mission']['points']:+d} 分；"
+                f"生存基础分 {base_score}，合计 {score} 分。",
+                decision="贡献结算",
+            )
         self._log("system", "游戏结束", reason, decision="结局")
+
+    def _contribution_breakdown(self, med_stats):
+        """结局贡献分项：医疗救治 / 难民安置 / 贸易援助（含联盟援助）。
+
+        每项给出可在结局页展示的明细（数量 × 分值）与小计；贡献可负。
+        医疗按全周期病例履历（康复/床日/病亡），难民按累计安置统计，
+        贸易援助按终局收敛统计——撤销/驳回/逾期等未形成结果的动作不在统计内，
+        每条订单/协议的终局只落一次，故撤销或失败都不会重复计分。
+        """
+        refugee = self.refugee_stats()
+        mission = self.mission_stats()
+        med_items = [
+            {"label": f"康复 {med_stats['recovered']} 人",
+             "count": med_stats["recovered"], "per": SCORE_MED_PER_RECOVERED,
+             "points": med_stats["recovered"] * SCORE_MED_PER_RECOVERED},
+            {"label": f"救治 {med_stats['care_days']} 床日",
+             "count": med_stats["care_days"], "per": SCORE_MED_PER_CARE_DAY,
+             "points": med_stats["care_days"] * SCORE_MED_PER_CARE_DAY},
+            {"label": f"病亡 {med_stats['deceased']} 人",
+             "count": med_stats["deceased"], "per": SCORE_MED_PER_DECEASED,
+             "points": med_stats["deceased"] * SCORE_MED_PER_DECEASED},
+        ]
+        med_points = sum(item["points"] for item in med_items)
+        refugee_items = [
+            {"label": f"接纳 {refugee['admitted']} 人",
+             "count": refugee["admitted"], "per": SCORE_REFUGEE_PER_ADMITTED,
+             "points": refugee["admitted"] * SCORE_REFUGEE_PER_ADMITTED},
+            {"label": f"检疫病亡 {refugee['quarantine_dead']} 人",
+             "count": refugee["quarantine_dead"], "per": SCORE_REFUGEE_PER_DEAD,
+             "points": refugee["quarantine_dead"] * SCORE_REFUGEE_PER_DEAD},
+            {"label": f"拒绝 {refugee['rejected']} 人",
+             "count": refugee["rejected"], "per": SCORE_REFUGEE_PER_REJECTED,
+             "points": refugee["rejected"] * SCORE_REFUGEE_PER_REJECTED},
+            {"label": f"遣返 {refugee['repatriated']} 人",
+             "count": refugee["repatriated"], "per": SCORE_REFUGEE_PER_REPATRIATED,
+             "points": refugee["repatriated"] * SCORE_REFUGEE_PER_REPATRIATED},
+        ]
+        refugee_points = sum(item["points"] for item in refugee_items)
+        mission_items = [
+            {"label": f"贸易援助成功 {mission['trade_delivered']} 笔",
+             "count": mission["trade_delivered"], "per": SCORE_TRADE_PER_DELIVERED,
+             "points": mission["trade_delivered"] * SCORE_TRADE_PER_DELIVERED},
+            {"label": f"贸易援助失败 {mission['trade_failed']} 笔",
+             "count": mission["trade_failed"], "per": SCORE_TRADE_PER_FAILED,
+             "points": mission["trade_failed"] * SCORE_TRADE_PER_FAILED},
+            {"label": f"联盟援助成功 {mission['aid_delivered']} 份",
+             "count": mission["aid_delivered"], "per": SCORE_AID_PER_DELIVERED,
+             "points": mission["aid_delivered"] * SCORE_AID_PER_DELIVERED},
+            {"label": f"联盟援助失败 {mission['aid_failed']} 份",
+             "count": mission["aid_failed"], "per": SCORE_AID_PER_FAILED,
+             "points": mission["aid_failed"] * SCORE_AID_PER_FAILED},
+        ]
+        mission_points = sum(item["points"] for item in mission_items)
+        return {
+            "total_bonus": med_points + refugee_points + mission_points,
+            "medical": {"points": med_points, "items": med_items},
+            "refugee": {"points": refugee_points, "items": refugee_items},
+            "mission": {"points": mission_points, "items": mission_items},
+        }
+
 
 
 RESOURCE_ZH = {"food": "食物", "water": "水源", "power": "电力", "oxygen": "氧气"}
